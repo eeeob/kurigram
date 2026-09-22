@@ -166,6 +166,10 @@ class Session:
         self.is_started = asyncio.Event()
         self.restart_lock = asyncio.Lock()
 
+        # Tracks scheduled `restart()` tasks, so `_create_restart_task` can tell a
+        #  restart is already pending and skip scheduling a redundant one.
+        self.restart_tasks: set[asyncio.Task] = set()
+
         # Never cleared: a stopped session is replaced rather than started again, since
         #  every caller that stops one then asks for a new one (`pyrogram/client.py:1428`).
         self._must_stay_stopped: bool = False
@@ -194,6 +198,31 @@ class Session:
 
         return task
 
+    def _create_restart_task(self, ignore_pending: bool = False) -> asyncio.Task | None:
+        # `start()`, `handle_packet`, `ping_worker` and `recv_worker` each detect
+        #  session failure independently and may all want to restart around the same
+        #  time. `restart_lock` only serializes them, so without this check a burst of
+        #  failures would chain into several redundant back-to-back restarts; skipping
+        #  while one is already pending is safe, since a single `restart()` recovers
+        #  the session regardless of which path triggered it. `restart()` removes
+        #  itself from `restart_tasks` right after `_stop()` (see there), so "pending"
+        #  only covers tearing down the dead connection, not the reconnect attempt
+        #  that follows: a failure once `start()` is running is a new problem and gets
+        #  its own restart. `ignore_pending` exists for `start()`'s own retry, which
+        #  must never be silently dropped or a failed reconnect leaves the session
+        #  stuck in `STARTING` for good.
+        if not ignore_pending and self.restart_tasks:
+            return
+
+        # A strong reference: an unreferenced task can be collected mid-execution.
+        #  https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task
+        task = asyncio.create_task(self.restart())
+
+        self.restart_tasks.add(task)
+        task.add_done_callback(self.restart_tasks.discard)
+
+        return task
+
     async def _wait_pending_tasks(self) -> None:
         # A tracked `handle_packet` spawns a tracked `handle_updates`, so one round can
         #  leave a task behind. Every level is already running, so the loop ends.
@@ -213,7 +242,7 @@ class Session:
 
     async def start(self):
         if self._state in (SessionState.STARTED, SessionState.STARTING):
-            log.debug("Session already started")
+            log.debug("Session already %s", self._state)
             return
 
         await self._set_state(SessionState.STARTING)
@@ -272,20 +301,24 @@ class Session:
                 )
 
             self.ping_task = asyncio.create_task(self.ping_worker())
-
-            log.info("Session initialized: Pyrogram v%s (Layer %s)", pyrogram.__version__, layer)
-            log.info("Device: %s - %s", self.client.device_model, self.client.app_version)
-            log.info("System: %s (%s)", self.client.system_version, self.client.lang_code)
         except (AuthKeyDuplicated, Unauthorized) as e:
             await self.stop()
             raise e
         except (OSError, RPCError) as e:
             log.info("Restarting session due to - %s - %s", e.__class__.__name__, e)
-            asyncio.create_task(self.restart())
+
+            # This retry must never be dropped by the dedup check in
+            #  `_create_restart_task`, or a failed reconnect leaves the session stuck
+            #  in `STARTING` with nothing left to try again.
+            self._create_restart_task(ignore_pending=True)
             return
         except Exception as e:
             await self.stop()
             raise e
+        else:
+            log.info("Session initialized: Pyrogram v%s (Layer %s)", pyrogram.__version__, layer)
+            log.info("Device: %s - %s", self.client.device_model, self.client.app_version)
+            log.info("System: %s (%s)", self.client.system_version, self.client.lang_code)
 
         await self._set_state(SessionState.STARTED)
         self.is_started.set()
@@ -306,12 +339,34 @@ class Session:
 
         await self._stop()
 
+        # `_stop()` deliberately leaves `self.results` alone, since a `restart()` keeps
+        #  the same `session_id` and, per the MTProto spec, "the server will resend
+        #  not-yet acknowledged content-related messages to a new connection if the
+        #  current connection is closed and then re-opened" (an `RpcResult` is
+        #  content-related): https://core.telegram.org/mtproto/description. This only
+        #  covers a reply the server already sent but we had not acked yet, and the
+        #  same page notes "the server may unilaterally forget any client sessions",
+        #  so it is a best effort, not a guarantee. Only here, where no new connection
+        #  is coming, does a pending waiter's msg id truly die with nothing to re-send
+        #  the request: failing each one now turns a silent `WAIT_TIMEOUT` into an
+        #  immediate, accurate error.
+        for result in self.results.values():
+            result.exception = TimeoutError("Session stopped before an answer arrived")
+            result.event.set()
+
+        self.results.clear()
+
     async def _stop(self) -> None:
         if self._state in (SessionState.STOPPED, SessionState.STOPPING):
-            log.debug("Session already stopped")
+            log.debug("Session already %s", self._state)
             return
 
         await self._set_state(SessionState.STOPPING)
+
+        # Wait before closing the connection and changing its state.
+        # Some tasks may have pending network requests, so give them one final chance
+        # to complete.
+        await self._wait_pending_tasks()
 
         self.ignore_count = 0
 
@@ -320,28 +375,24 @@ class Session:
         self.stored_msg_ids.clear()
 
         # The unsent acks name msg ids of the connection this stop closes, which the
-        #  server cannot match after a reconnect.
+        #  server cannot match after a reconnect. The server will send them again
+        #  after reconnecting.
         self.pending_acks.clear()
 
-        # A pending waiter's msg id also dies with the connection and nothing re-sends
-        #  the request, so no answer can arrive: failing each waiter here turns a
-        #  silent `WAIT_TIMEOUT` into an immediate, accurate error.
-        for result in self.results.values():
-            result.exception = TimeoutError("Session stopped before an answer arrived")
-            result.event.set()
-
-        self.results.clear()
+        # `self.results` is intentionally not touched here; see `stop()`, the only
+        #  caller that gives up on pending answers for good.
 
         self.ping_task_event.set()
 
         if self.ping_task is not None:
             await self.ping_task
+            self.ping_task = None
 
         self.ping_task_event.clear()
 
         await self.connection.close()
 
-        if self.recv_task:
+        if self.recv_task is not None:
             await self.recv_task
             self.recv_task = None
 
@@ -362,7 +413,12 @@ class Session:
             if self.stored_msg_ids:
                 self.recent_msg_ids = self.stored_msg_ids[:30]
 
-            await self._stop()
+            current_task = asyncio.current_task()
+
+            try:
+                await self._stop()
+            finally:
+                self.restart_tasks.discard(current_task)
 
             if self._must_stay_stopped:
                 return
@@ -388,7 +444,7 @@ class Session:
         except ValueError as e:
             log.debug(e)
             log.info("Restarting session due to - %s - %s", e.__class__.__name__, e)
-            asyncio.create_task(self.restart())
+            self._create_restart_task()
             return
 
         messages = data.body.messages if isinstance(data.body, MsgContainer) else [data]
@@ -410,6 +466,7 @@ class Session:
                     del self.stored_msg_ids[: Session.STORED_MSG_IDS_MAX_SIZE // 2]
 
                 if msg.msg_id in self.recent_msg_ids:
+                    # If the server sends it again, it should be processed.
                     self.recent_msg_ids.remove(msg.msg_id)
                     raise SecurityCheckMismatch(
                         "The msg_id is belong to most recent closed connection."
@@ -450,7 +507,11 @@ class Session:
 
                 if self.ignore_count >= self.MAX_CONSECUTIVE_IGNORED:
                     log.info("Restarting session due to - %s - %s", e.__class__.__name__, e)
-                    asyncio.create_task(self.restart())
+
+                    # Not reset here: `_stop()` resets it once the scheduled `restart()`
+                    #  actually runs, and `_create_restart_task` already skips a second
+                    #  one in the meantime regardless of how high this climbs.
+                    self._create_restart_task()
 
                 return
             else:
@@ -491,12 +552,15 @@ class Session:
         if len(self.pending_acks) >= self.ACKS_THRESHOLD:
             log.debug("Sending %s acks", len(self.pending_acks))
 
+            pending_acks = list(self.pending_acks)
+            self.pending_acks.clear()  # Guards against repeated resending.
+
             try:
-                await self.send(raw.types.MsgsAck(msg_ids=list(self.pending_acks)), False)
+                await self.send(raw.types.MsgsAck(msg_ids=pending_acks), wait_response=False)
             except OSError:
+                # Dropped, not re-queued: the server resends anything it never sees
+                #  acked, the same reasoning `_stop()` applies to `pending_acks`.
                 pass
-            else:
-                self.pending_acks.clear()
 
     def _current_salt(self, server_time: float) -> int:
         """Get the salt valid at `server_time`, dropping the ones it has passed"""
@@ -553,7 +617,7 @@ class Session:
                 )
             except OSError as e:
                 log.info("Restarting session due to - %s - %s", e.__class__.__name__, e)
-                asyncio.create_task(self.restart())
+                self._create_restart_task()
                 break
             except RPCError:
                 pass
@@ -603,7 +667,7 @@ class Session:
                         error = "Server sent a null packet."
 
                     log.info("Restarting session due to - %s", error)
-                    asyncio.create_task(self.restart())
+                    self._create_restart_task()
 
                 break
 
@@ -620,8 +684,7 @@ class Session:
         pending_result: Result | None = None
 
         if wait_response:
-            pending_result = Result()
-            self.results[msg_id] = pending_result
+            self.results[msg_id] = pending_result = Result()
 
         log.debug("Sent: %s", message)
 
@@ -709,7 +772,7 @@ class Session:
                 amount = e.seconds
 
                 if amount is None or amount > sleep_threshold >= 0:
-                    raise
+                    raise e
 
                 log.warning(
                     '[%s] Waiting for %s seconds before continuing (required by "%s")',
