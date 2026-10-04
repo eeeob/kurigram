@@ -1578,6 +1578,9 @@ class Message(Object, Update):
 
         await client.message_cache.set((parsed_message.chat.id, parsed_message.id), parsed_message)
 
+        if min_peer_ids := await utils.get_message_min_peer_ids(client, parsed_message):
+            await client.min_peer_cache.add(min_peer_ids, parsed_message.chat.id, parsed_message.id)
+
         return parsed_message
 
     @staticmethod
@@ -2014,6 +2017,9 @@ class Message(Object, Update):
             await client.message_cache.set(
                 (parsed_message.chat.id, parsed_message.id), parsed_message
             )
+
+        if min_peer_ids := await utils.get_message_min_peer_ids(client, parsed_message):
+            await client.min_peer_cache.add(min_peer_ids, parsed_message.chat.id, parsed_message.id)
 
         return parsed_message
 
